@@ -3,6 +3,7 @@ from discord import app_commands
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
+import re
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import io
@@ -21,6 +22,62 @@ EMOJIS = {"red": "🔴", "blue": "🔵", "green": "🟢", "yellow": "🟡", "1st
 TEAMS = ['red', 'blue', 'green', 'yellow']
 DEFAULT_ROLL_RANGE = (100, 200)
 ACTIVE_SUBMISSIONS = {}
+
+# Role rulesheets sent alongside each reveal. Keys must be lowercase and match
+# the role name as it appears in the pasted list (e.g. "Cheater" -> "cheater").
+ROLE_RULES = {
+    "town": (
+        "### :green_circle: Town (6) - Town\n"
+        "- +5 points each time you win a 1v1.\n"
+        "- +3 points per evil player that gets voted out.\n"
+        "  - An additional 2 points if you voted for them when they went out.\n"
+        "  - An additional 3 points if you just played against them.\n"
+        "- -3 points if you voted for a Town player when they went out.\n"
+        "- -1 point for abstaining (not voting before the timer is up)."
+    ),
+    "cheater": (
+        "### :red_circle: Cheater (2) - Evil\n"
+        "- +3 points each time you win a 1v1.\n"
+        "- -15 points if you don't win 1v1.\n"
+        "- +5 points per town player that gets voted out.\n"
+        "  - The Cheater *always* has refresh cooldowns enabled. They may not turn it off.\n"
+        "  - Cheaters never play against each other.\n"
+        "  - The Cheater becomes the Exposed role if they are voted out."
+    ),
+    "flamer": (
+        "### :orange_circle: Flamer (1) - Evil\n"
+        "- +3 points each time you win a 1v1.\n"
+        "- +5 points per town player that gets voted out.\n"
+        "  - The name of a random town is given to you. If they are voted out you get +10 points. "
+        "You are guaranteed to play against them on the first round.\n"
+        "  - The Flamer becomes the Exposed role if they are voted out."
+    ),
+    "exposed": (
+        "### :red_circle: Exposed (0)\n"
+        "- +5 points each time you win a 1v1.\n"
+        "- +3 points per town player that gets voted out.\n"
+        "  - The Exposed does *not* retain any abilities from either Cheater or Flamer."
+    ),
+    "jester": (
+        "### :purple_circle: Jester (1) -  Neutral\n"
+        "- +3 points each time you win a 1v1.\n"
+        "  - +15 points if you get voted out.\n"
+        "  - -3 points to each player who voted for you if you are voted out."
+    ),
+}
+
+# Roles that flip to Exposed if voted out — those players get the Exposed
+# rules bundled in at reveal time so they know what's coming.
+BECOMES_EXPOSED_IF_VOTED_OUT = {"cheater", "flamer"}
+
+# Matches lines like:
+#   Cheater - Trizzy
+#   Flamer - Oscar (Target Opossos)
+ROLE_LINE_PATTERN = re.compile(
+    r"^\s*(?P<role>[A-Za-z][A-Za-z\s]*?)\s*-\s*(?P<name>[A-Za-z0-9_]+)"
+    r"(?:\s*\(\s*Target\s+(?P<target>[A-Za-z0-9_]+)\s*\))?\s*$",
+    re.IGNORECASE,
+)
 
 # Initialize Google Sheets client
 creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', SCOPES)
@@ -152,6 +209,97 @@ class SheetManager:
                 })
 
         return data
+
+
+class RevealRoleModal(discord.ui.Modal, title="Reveal Roles"):
+    """Paste a role list, bot drops each role into that player's -liason channel privately."""
+    roles_text = discord.ui.TextInput(
+        label="Paste the role list",
+        style=discord.TextStyle.paragraph,
+        placeholder="Cheater - Trizzy\nFlamer - Oscar (Target Opossos)\nTown - Andy",
+        max_length=4000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        lines = [l.strip() for l in self.roles_text.value.splitlines() if l.strip()]
+        results = []
+        guild = interaction.guild
+
+        # First pass: parse every line before sending anything, so we know the
+        # full roster (e.g. who all the Cheaters are) before any message goes out.
+        parsed_entries = []
+        for line in lines:
+            # Strip any leading emoji/symbols (e.g. team-color dots) before parsing
+            cleaned_line = re.sub(r"^[^A-Za-z]+", "", line).strip()
+            match = ROLE_LINE_PATTERN.match(cleaned_line)
+            if not match:
+                results.append(f"⚠️ Couldn't parse: `{line}`")
+                continue
+
+            parsed_entries.append({
+                "role": match.group("role").strip(),
+                "name": match.group("name").strip(),
+                "target": match.group("target"),
+            })
+
+        cheater_names = [
+            e["name"] for e in parsed_entries if e["role"].lower().strip() == "cheater"
+        ]
+
+        for entry in parsed_entries:
+            role = entry["role"]
+            name = entry["name"]
+            target = entry["target"]
+
+            channel = discord.utils.find(
+                lambda c: isinstance(c, discord.TextChannel)
+                and c.name.lower().startswith(name.lower() + "-"),
+                guild.text_channels,
+            )
+
+            if channel is None:
+                results.append(f"❌ No channel found for **{name}** (looked for `{name.lower()}-...`)")
+                continue
+
+            msg = f"**Your role: {role}**"
+            if target:
+                msg += f"\nYour target: **{target}**"
+
+            rules = ROLE_RULES.get(role.lower().strip())
+            if rules:
+                msg += f"\n\n{rules}"
+            else:
+                results.append(f"⚠️ No rules found for role '{role}' ({name}) — sent role name only.")
+
+            if role.lower().strip() in BECOMES_EXPOSED_IF_VOTED_OUT:
+                exposed_rules = ROLE_RULES.get("exposed")
+                if exposed_rules:
+                    msg += (
+                        f"\n\nIf you are voted out, you become **Exposed**:\n\n{exposed_rules}"
+                    )
+
+            if role.lower().strip() == "cheater":
+                other_cheaters = [n for n in cheater_names if n != name]
+                if other_cheaters:
+                    msg += f"\n\nYour fellow Cheater(s): **{', '.join(other_cheaters)}**"
+                else:
+                    results.append(f"⚠️ {name} is the only Cheater in this list — no partner to reveal.")
+
+            try:
+                await channel.send(msg)
+                results.append(f"✅ {role} → {name} (#{channel.name})")
+            except discord.Forbidden:
+                results.append(f"❌ No permission to post in #{channel.name}")
+            except discord.HTTPException as e:
+                results.append(f"❌ Failed to send to #{channel.name}: {e}")
+
+        summary = "\n".join(results) if results else "Nothing parsed — check your formatting."
+        for i in range(0, len(summary), 1900):
+            await interaction.followup.send(summary[i:i + 1900], ephemeral=True)
+
 
 class BattleStatsBot(discord.Client):
     def __init__(self):
@@ -350,6 +498,15 @@ async def ping(interaction: discord.Interaction):
         await interaction.response.send_message("❌ This command is restricted to admins or Agents of Chaos only.", ephemeral=True)
         return
     await interaction.response.send_message("Pong! 🏓")
+
+@bot.tree.command(name="revealrole", description="Privately reveal roles to each player's liason channel")
+async def revealrole_command(interaction: discord.Interaction):
+    if not has_permission(interaction):
+        await interaction.response.send_message("❌ This command is restricted to admins or Agents of Chaos only.", ephemeral=True)
+        return
+    # Modals must be the initial response, so no defer here — permission check
+    # above already ran before we touch interaction.response.
+    await interaction.response.send_modal(RevealRoleModal())
 
 @bot.tree.command(name="roll", description="Roll for yourself or your entire team")
 @app_commands.describe(team="Optional: Specify a team to roll for all members")
