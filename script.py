@@ -42,6 +42,7 @@ ROLE_RULES = {
         "- +5 points per town player that gets voted out.\n"
         "  - The Cheater *always* has refresh cooldowns enabled. They may not turn it off.\n"
         "  - Cheaters never play against each other.\n"
+        "  - Each Cheater knows who the other Cheater is.\n"
         "  - The Cheater becomes the Exposed role if they are voted out."
     ),
     "flamer": (
