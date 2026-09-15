@@ -285,7 +285,7 @@ class RevealRoleModal(discord.ui.Modal, title="Reveal Roles"):
             if role.lower().strip() == "cheater":
                 other_cheaters = [n for n in cheater_names if n != name]
                 if other_cheaters:
-                    msg += f"\n\nYour fellow Cheater(s): **{', '.join(other_cheaters)}**"
+                    msg += f"\n\nYour fellow Cheater: **{', '.join(other_cheaters)}**"
                 else:
                     results.append(f"⚠️ {name} is the only Cheater in this list — no partner to reveal.")
 
